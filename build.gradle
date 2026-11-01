@@ -1,0 +1,399 @@
+plugins {
+	id 'fabric-loom' version '1.6.1-SNAPSHOT'
+	id 'maven-publish'
+}
+
+import org.objectweb.asm.*
+import org.objectweb.asm.tree.*
+import java.nio.file.*
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.*
+
+task copyDeps(type: Copy) {
+	from {
+		configurations.runtimeClasspath + configurations.libImpl + configurations.modImpl + configurations.modCompileOnly
+	}
+	into 'libs'
+}
+
+sourceCompatibility = JavaVersion.VERSION_21
+targetCompatibility = JavaVersion.VERSION_21
+
+archivesBaseName = project.archives_base_name
+version = project.mod_version
+group = project.maven_group
+
+loom {
+	accessWidenerPath = file("src/main/resources/thunderhack.accesswidener")
+}
+
+repositories {
+	maven {
+		name = "jitpack.io"
+		url = "https://jitpack.io"
+	}
+	maven {
+		url "https://maven.redstones.dev/releases"
+	}
+	maven {
+		name = 'swt-repo'
+		url = "https://maven-eclipse.github.io/maven"
+	}
+	maven {
+		name = "meteor-maven"
+		url = "https://maven.meteordev.org/releases"
+	}
+	maven {
+		name = "meteor-maven-snapshots"
+		url = "https://maven.meteordev.org/snapshots"
+	}
+
+	mavenCentral()
+}
+
+configurations {
+	libImpl
+	modImpl
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+	modImplementation 'dev.redstones.mediaplayerinfo:media-player-info:0.1.0'
+	modImplementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.10"
+	include "org.jetbrains.kotlin:kotlin-stdlib:1.9.10"
+	include 'dev.redstones.mediaplayerinfo:media-player-info:0.1.0'
+
+	libImpl("meteordevelopment:orbit:${project.orbit_version}")
+	modCompileOnly "meteordevelopment:baritone:1.21-SNAPSHOT"
+
+	libImpl("io.netty:netty-handler-proxy:${project.netty_version}") { transitive = false }
+	libImpl("io.netty:netty-codec-socks:${project.netty_version}") { transitive = false }
+
+	configurations.libImpl.dependencies.each {
+		implementation(it)
+	}
+
+	configurations.modImpl.dependencies.each {
+		modImplementation(it)
+		include(it)
+	}
+
+	// ASM для безопасной трансформации байткода
+	implementation 'org.ow2.asm:asm:9.6'
+	implementation 'org.ow2.asm:asm-tree:9.6'
+	implementation 'org.ow2.asm:asm-commons:9.6'
+	implementation 'org.ow2.asm:asm-util:9.6'
+}
+
+processResources {
+	inputs.property "version", project.version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 21
+}
+
+java {
+	withSourcesJar()
+}
+
+jar {
+	from("LICENSE") {
+		rename { "${it}_${project.archivesBaseName}"}
+	}
+	from {
+		configurations.libImpl.collect { it.isDirectory() ? it : zipTree(it) }
+	}
+	duplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+
+	manifest {
+		attributes(
+				'Implementation-Title': project.name,
+				'Implementation-Version': project.version,
+				'Built-By': System.getProperty('user.name'),
+		)
+	}
+
+	doLast {
+		applyAntiMeinerLeak(archiveFile.get().asFile)
+	}
+}
+
+
+class StringEncryptor {
+	private static final int K1 = 0xDEADBEEF
+	private static final int K2 = 0xCAFEBABE
+
+	static String encrypt(String original) {
+		if (original == null || original.isEmpty()) return original
+		byte[] bytes = original.getBytes("UTF-8")
+		byte[] result = new byte[bytes.length * 6]
+		for (int i = 0; i < bytes.length; i++) {
+			int base = i * 6
+			byte b = bytes[i]
+			result[base]     = (byte)(b ^ ((K1 >> ((i % 4) * 8)) & 0xFF))
+			result[base + 1] = (byte)(b ^ ((K2 >> ((i % 4) * 8)) & 0xFF))
+			result[base + 2] = result[base]
+			result[base + 3] = result[base + 1]
+			result[base + 4] = (byte)0xAA
+			result[base + 5] = (byte)0x55
+		}
+		return "测试" + Base64.getEncoder().encodeToString(result) + "完成"
+	}
+
+	static int encryptInt(int v) { v ^ K1 }
+}
+
+class AntiMeinerLeakTransformer extends ClassVisitor {
+	private String className
+	private boolean transform
+	private int strCount = 0, intCount = 0
+	private Random rnd = new Random()
+	private final AtomicInteger fakeCounter
+
+	AntiMeinerLeakTransformer(ClassVisitor cv, String cn, AtomicInteger counter) {
+		super(Opcodes.ASM9, cv);
+		className = cn;
+		this.fakeCounter = counter;
+
+		if (cn.equals("thunder/hack/features/modules/Module") ||
+				cn.startsWith("thunder/hack/features/cmd/")) {
+			transform = false;
+			return;
+		}
+
+		transform = cn.startsWith("thunder/hack/features/");
+	}
+
+	@Override
+	public void visit(int v, int a, String n, String s, String sup, String[] intf) {
+		if (transform) {
+			super.visitAnnotation("Ljava/lang/Deprecated;", true)?.visitEnd()
+			if (rnd.nextBoolean()) {
+				String[] ni = new String[intf.length + 1]
+				System.arraycopy(intf, 0, ni, 0, intf.length)
+				ni[intf.length] = "java/lang/Cloneable"
+				intf = ni
+			}
+			String[] ni2 = new String[intf.length + 1]
+			System.arraycopy(intf, 0, ni2, 0, intf.length)
+			ni2[intf.length] = "java/io/Serializable"
+			intf = ni2
+			super.visitSource("AntiLeak.java", null)
+		}
+		super.visit(v, a, n, s, sup, intf)
+	}
+
+	@Override
+	void visitEnd() {
+		if (transform) {
+			3.times {
+				String fakeField = "leak_" + fakeCounter.incrementAndGet() + "\u200B"
+				int mods = Opcodes.ACC_PRIVATE + Opcodes.ACC_STATIC + (rnd.nextBoolean() ? Opcodes.ACC_FINAL : Opcodes.ACC_VOLATILE)
+				String desc = rnd.nextBoolean() ? "I" : "J"
+				super.visitField(mods, fakeField, desc, null, null)?.visitEnd()
+			}
+
+			3.times {
+				String fakeMethod = "protect_" + fakeCounter.incrementAndGet() + "\u200B"
+				int mmods = Opcodes.ACC_PRIVATE + Opcodes.ACC_STATIC + (rnd.nextBoolean() ? Opcodes.ACC_SYNCHRONIZED : 0)
+				MethodVisitor mv = super.visitMethod(mmods, fakeMethod, "()V", null, null)
+				if (mv) {
+					mv.visitCode()
+					mv.visitLdcInsn("完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成完成")
+					mv.visitInsn(Opcodes.POP)
+					mv.visitInsn(Opcodes.ICONST_1)
+					mv.visitInsn(Opcodes.ICONST_2)
+					mv.visitInsn(Opcodes.IADD)
+					mv.visitInsn(Opcodes.POP)
+					for (int i = 0; i < rnd.nextInt(8); i++) mv.visitInsn(Opcodes.NOP)
+					mv.visitInsn(Opcodes.RETURN)
+					mv.visitMaxs(2, 0)
+					mv.visitEnd()
+				}
+			}
+		}
+		super.visitEnd()
+	}
+
+	@Override
+	MethodVisitor visitMethod(int a, String n, String d, String s, String[] e) {
+		MethodVisitor mv = super.visitMethod(a, n, d, s, e)
+		if (!transform || mv == null) return mv
+
+		boolean isClinit = n == "<clinit>"
+		boolean isInit = n == "<init>"
+
+		if (isClinit || isInit) {
+			return new MethodVisitor(Opcodes.ASM9, mv) {
+				@Override
+				void visitLdcInsn(Object c) {
+					if (c instanceof String && shouldEncrypt((String)c)) {
+						strCount++
+						super.visitLdcInsn(StringEncryptor.encrypt((String)c))
+						super.visitMethodInsn(Opcodes.INVOKESTATIC, "thunder/hack/utility/AntiMeinerLeakUtil", "d", "(Ljava/lang/String;)Ljava/lang/String;", false)
+						return
+					}
+					if (c instanceof Integer && (int)c > 0 && rnd.nextBoolean()) {
+						intCount++
+						super.visitLdcInsn(StringEncryptor.encryptInt((int)c))
+						super.visitMethodInsn(Opcodes.INVOKESTATIC, "thunder/hack/utility/AntiMeinerLeakUtil", "dInt", "(I)I", false)
+						return
+					}
+					super.visitLdcInsn(c)
+				}
+			}
+		}
+
+		return new MethodVisitor(Opcodes.ASM9, mv) {
+			private int flow = 0
+
+			@Override
+			void visitLdcInsn(Object c) {
+				if (c instanceof String && shouldEncrypt((String)c)) {
+					strCount++
+					super.visitLdcInsn(StringEncryptor.encrypt((String)c))
+					super.visitMethodInsn(Opcodes.INVOKESTATIC, "thunder/hack/utility/AntiMeinerLeakUtil", "d", "(Ljava/lang/String;)Ljava/lang/String;", false)
+					return
+				}
+				if (c instanceof Integer && (int)c > 0 && rnd.nextBoolean()) {
+					intCount++
+					super.visitLdcInsn(StringEncryptor.encryptInt((int)c))
+					super.visitMethodInsn(Opcodes.INVOKESTATIC, "thunder/hack/utility/AntiMeinerLeakUtil", "dInt", "(I)I", false)
+					return
+				}
+				super.visitLdcInsn(c)
+			}
+
+			@Override
+			void visitInsn(int op) {
+				flow++
+				if (flow % 2 == 0 && rnd.nextInt(1) == 0) {
+					Label l = new Label()
+					super.visitInsn(Opcodes.ICONST_1)
+					super.visitJumpInsn(Opcodes.IFNE, l)
+					super.visitInsn(Opcodes.NOP)
+					super.visitLabel(l)
+				}
+				if (rnd.nextInt(2) == 0) {
+					String base = "PacketHandler"
+					def chars = base.toCharArray().collect { String.valueOf(it) }
+					if (rnd.nextBoolean()) {
+						java.util.Collections.shuffle(chars, rnd)
+					}
+					def garbagePool = ['$', '%', '#', '@', '!', '~', '★', '♥', '♪', '→', '•'] as List<String>
+					def tokens = ['garbage', 'goto', 'spamVar', '_g', '_x', '//JUNK'] as List<String>
+					int maxNewlines = 5
+					int maxTotalLength = 1024
+					StringBuilder sb = new StringBuilder()
+					for (c in chars) {
+						if (sb.length() >= maxTotalLength) break
+						sb.append(c)
+						if (rnd.nextInt(2) == 0) {
+							sb.append(garbagePool[rnd.nextInt(garbagePool.size())])
+						}
+						if (rnd.nextInt(3) == 0) {
+							sb.append(tokens[rnd.nextInt(tokens.size())])
+						}
+
+						int nl = rnd.nextInt(maxNewlines + 1)
+						for (int i = 0; i < nl; i++) {
+							sb.append('\n')
+							if (sb.length() >= maxTotalLength) break
+						}
+						if (rnd.nextInt(3) == 0 && sb.length() < maxTotalLength - 20) {
+							sb.append("var").append(Math.abs(rnd.nextInt() % 1000))
+						}
+					}
+
+					String stretched = sb.toString().trim()
+					if (stretched.isEmpty()) stretched = "p"
+					super.visitLdcInsn(stretched)
+					super.visitInsn(Opcodes.POP)
+				}
+				super.visitInsn(op)
+			}
+		}
+	}
+
+	private boolean shouldEncrypt(String str) {
+		if (str == null || str.isEmpty() || str.length() < 2) return false
+		if (str.contains("%") || str.contains("§") || str.contains("{") || str.contains("}")) return false
+		if (str.matches(".*\\d+\\.\\d+.*|.*\\d+m/s|.*\\d+ms.*")) return false
+		if (str.matches("^[A-Z_]+\$") || str.matches("^[a-z][a-zA-Z0-9]*\$")) return false
+		if (str.contains("/") || str.contains(".class")) return false
+		if (str.matches("\\(.*\\).*")) return false
+		if (str.matches("^L.*;") || str.matches("^\\[+[ZBCSIJFDL].*")) return false
+		def skip = ["minecraft:", "fabric:", "java.", "net.minecraft", "org.", "kit", "execute", "command", "literal", "brigadier"]
+		if (skip.any { str.startsWith(it) }) return false
+		return true
+	}
+
+	int getStrings() { strCount }
+	int getInts() { intCount }
+}
+
+def applyAntiMeinerLeak(File jar) {
+	println "\nAntiMeinerLeak v26.0 applied"
+	def start = System.currentTimeMillis()
+	def tmp = new File(jar.parent, jar.name + ".tmp")
+	def stats = [total:0, prot:0, str:0, int:0]
+	def fakeCounter = new AtomicInteger(0)
+
+	new ZipFile(jar).withCloseable { zin ->
+		new ZipOutputStream(new FileOutputStream(tmp)).withCloseable { zout ->
+			zin.entries().each { ent ->
+				if (ent.name.endsWith(".class")) {
+					stats.total++
+					byte[] b = zin.getInputStream(ent).bytes
+					def r = new ClassReader(b)
+					def w = new ClassWriter(0)
+					def t = new AntiMeinerLeakTransformer(w, ent.name, fakeCounter)
+					r.accept(t, ClassReader.EXPAND_FRAMES)
+					byte[] mod = w.toByteArray()
+
+					int s = t.getStrings()
+					int i = t.getInts()
+					stats.str += s
+					stats.int += i
+
+					if (s > 0 || i > 0) {
+						stats.prot++
+						println "Protected: ${ent.name} (+$s strings, +$i ints)"
+						zout.putNextEntry(new ZipEntry(ent.name))
+						zout.write(mod)
+					} else {
+						zout.putNextEntry(new ZipEntry(ent.name))
+						zout.write(b)
+					}
+				} else {
+					zout.putNextEntry(new ZipEntry(ent.name))
+					zin.getInputStream(ent).withStream { zout << it }
+				}
+				zout.closeEntry()
+			}
+		}
+	}
+	jar.delete()
+	tmp.renameTo(jar)
+	println "Done in ${(System.currentTimeMillis() - start)}ms | Total encrypted strings: ${stats.str}\n"
+}
+
+publishing {
+	publications {
+		mavenJava(MavenPublication) {
+			from components.java
+		}
+	}
+	repositories {
+	}
+}
